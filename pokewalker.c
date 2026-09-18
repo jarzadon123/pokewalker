@@ -1,52 +1,101 @@
 #include <stdio.h>
-#include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "driver/uart.h"
-#include "driver/gpio.h"
-#include "esp_log.h"
+#include <stdint.h>
+#include <stdbool.h>
 
-static const char *TAG = "IRDA_TEST";
+// Standard Pokewalker Packet Structure (10-byte header frame)
+typedef struct {
+    uint8_t  command;
+    uint8_t  sub_command;
+    uint32_t session_id;
+    uint16_t checksum;
+    uint16_t payload_len;
+} __attribute__((packed)) pokewalker_header_t;
 
-#define UART_PORT        UART_NUM_1
-#define TX_PIN           GPIO_NUM_17
-#define RX_PIN           GPIO_NUM_16
-#define BUF_SIZE         (1024)
+/**
+ * @brief Pokewalker custom 16-bit checksum algorithm.
+ * Operates on the de-obfuscated bytes excluding the checksum field itself.
+ */
+uint16_t calculate_pokewalker_checksum(const uint8_t *buffer, size_t length) {
+    uint32_t sum = 0;
+    for (size_t i = 0; i < length; i++) {
+        // Skip the two checksum bytes located at index 6 and 7 in the frame header
+        if (i == 6 || i == 7) continue; 
+        sum += buffer[i];
+    }
+    return (uint16_t)(sum & 0xFFFF);
+}
 
-void app_main(void) {
-    uart_config_t uart_config = {
-        .baud_rate  = 115200,
-        .data_bits  = UART_DATA_8_BITS,
-        .parity     = UART_PARITY_DISABLE,
-        .stop_bits  = UART_STOP_BITS_1,
-        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+/**
+ * @brief De-obfuscates raw IR bytes by XORing each with 0xAA in-place.
+ */
+void deobfuscate_buffer(uint8_t *buffer, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        buffer[i] ^= 0xAA;
+    }
+}
+
+/**
+ * @brief Parses and validates an incoming raw Pokewalker packet buffer.
+ */
+bool parse_pokewalker_packet(uint8_t *raw_buf, size_t len) {
+    if (len < sizeof(pokewalker_header_t)) {
+        printf("[ERROR] Packet length (%zu) too short for header.\n", len);
+        return false;
+    }
+
+    // 1. De-obfuscate raw byte stream in-place
+    deobfuscate_buffer(raw_buf, len);
+
+    // 2. Extract header fields (Little-Endian layout)
+    pokewalker_header_t header;
+    header.command     = raw_buf[0];
+    header.sub_command = raw_buf[1];
+    header.session_id  = (uint32_t)raw_buf[2] | ((uint32_t)raw_buf[3] << 8) | 
+                         ((uint32_t)raw_buf[4] << 16) | ((uint32_t)raw_buf[5] << 24);
+    header.checksum    = (uint16_t)raw_buf[6] | ((uint16_t)raw_buf[7] << 8);
+    header.payload_len = (uint16_t)raw_buf[8] | ((uint16_t)raw_buf[9] << 8);
+
+    // 3. Verify total packet length matches expected header declaration
+    size_t expected_total_len = sizeof(pokewalker_header_t) + header.payload_len;
+    if (len < expected_total_len) {
+        printf("[ERROR] Incomplete payload. Expected: %zu bytes, Got: %zu bytes\n", 
+               expected_total_len, len);
+        return false;
+    }
+
+    // 4. Validate Checksum
+    uint16_t calculated_crc = calculate_pokewalker_checksum(raw_buf, expected_total_len);
+    bool checksum_valid = (calculated_crc == header.checksum);
+
+    // 5. Print Detailed Output
+    printf("--- PARSED POKEWALKER PACKET ---\n");
+    printf("Command ID     : 0x%02X\n", header.command);
+    printf("Sub-Command    : 0x%02X\n", header.sub_command);
+    printf("Session ID     : 0x%08X\n", header.session_id);
+    printf("Payload Length : %u bytes\n", header.payload_len);
+    printf("Header Checksum: 0x%04X\n", header.checksum);
+    printf("Calculated CRC : 0x%04X\n", calculated_crc);
+    printf("Status         : %s\n", checksum_valid ? "VALID (PASS)" : "INVALID (FAIL)");
+    printf("--------------------------------\n");
+
+    return checksum_valid;
+}
+
+int main(void) {
+    // Simulated raw byte stream captured over IrDA (XOR-obfuscated with 0xAA)
+    // Command 0x30, Sub 0x01, Session ID 0x12345678, Checksum 0x0211, Payload Length 0x0002
+    uint8_t test_raw_packet[] = {
+        0x9A, 0xAB,                   // Obfuscated Cmd (0x30), SubCmd (0x01)
+        0xD2, 0x9E, 0x9E, 0xB8,       // Obfuscated Session ID (0x12345678)
+        0xBB, 0xA8,                   // Obfuscated Checksum (0x0211)
+        0xA8, 0xAA,                   // Obfuscated Payload Len (0x0002)
+        0xDE, 0xAD                    // Obfuscated Payload Data
     };
 
-    uart_driver_install(UART_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0);
-    uart_param_config(UART_PORT, &uart_config);
-    uart_set_pin(UART_PORT, TX_PIN, RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    size_t packet_size = sizeof(test_raw_packet);
 
-    const uint8_t test_data[] = {0xAA, 0x55, 0xFF};
-    uint8_t rx_buffer[BUF_SIZE];
+    printf("Processing %zu-byte raw IR packet...\n\n", packet_size);
+    parse_pokewalker_packet(test_raw_packet, packet_size);
 
-    ESP_LOGI(TAG, "UART initialized, starting loopback test...");
-
-    while (1) {
-        // Transmit bytes over IrDA port
-        uart_write_bytes(UART_PORT, (const char *)test_data, sizeof(test_data));
-        ESP_LOGI(TAG, "Sent 3 bytes");
-
-        // Read incoming response from IrDA port
-        int len = uart_read_bytes(UART_PORT, rx_buffer, sizeof(rx_buffer), pdMS_TO_TICKS(100));
-        
-        if (len > 0) {
-            ESP_LOGI(TAG, "Received %d bytes:", len);
-            ESP_LOG_BUFFER_HEX(TAG, rx_buffer, len);
-        } else {
-            ESP_LOGW(TAG, "No loopback data received");
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    return 0;
 }
